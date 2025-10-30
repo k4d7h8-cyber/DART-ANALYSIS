@@ -9,6 +9,7 @@ import 'package:xml/xml.dart' as xml;
 
 const String dartBaseUrl = 'https://opendart.fss.or.kr/api/';
 const String CORP_CODE_ENDPOINT = 'corpCode.xml';
+const String FIN_RPT_ENDPOINT = 'fnltt_lssum.json';
 
 class CorpInfo {
   const CorpInfo({
@@ -31,6 +32,70 @@ class CorpInfo {
   final String corpName;
   final String stockCode;
   final String modifyDate;
+}
+
+class ReportInfo {
+  const ReportInfo({
+    required this.corpCode,
+    required this.corpName,
+    required this.bizRepr,
+    required this.bsnsYear,
+    required this.fsDiv,
+    required this.stockCode,
+    required this.oprtPrfit,
+    required this.thstrmNtic,
+    required this.fnclTotasset,
+  });
+
+  factory ReportInfo.fromJson(
+    Map<String, dynamic> json, {
+    String fallbackCorpName = '',
+  }) {
+    String readField(List<String> keys, {String fallback = ''}) {
+      for (final String key in keys) {
+        final dynamic value = json[key];
+        if (value == null) {
+          continue;
+        }
+        final String text = value.toString().trim();
+        if (text.isNotEmpty) {
+          return text;
+        }
+      }
+      return fallback;
+    }
+
+    return ReportInfo(
+      corpCode: readField(<String>['corp_code']),
+      corpName: readField(
+        <String>['corp_name', 'corp_nm'],
+        fallback: fallbackCorpName,
+      ),
+      bizRepr: readField(<String>['biz_repr', 'biz_rptm', 'biz_nm']),
+      bsnsYear: readField(<String>['bsns_year']),
+      fsDiv: readField(<String>['fs_div', 'fs_cd', 'fs_nm']),
+      stockCode: readField(<String>['stock_code']),
+      oprtPrfit: readField(
+        <String>['oprt_prfit', 'oprt_prft', 'oper_profit'],
+      ),
+      thstrmNtic: readField(
+        <String>['thstrm_ntic', 'thstrm_net_income', 'thstrm_ntpl_loss'],
+      ),
+      fnclTotasset: readField(
+        <String>['fncl_totasset', 'thstrm_assets', 'tot_assets'],
+      ),
+    );
+  }
+
+  final String corpCode;
+  final String corpName;
+  final String bizRepr;
+  final String bsnsYear;
+  final String fsDiv;
+  final String stockCode;
+  final String oprtPrfit;
+  final String thstrmNtic;
+  final String fnclTotasset;
 }
 
 Future<List<CorpInfo>> fetchAllCorpCodes(String apiKey) async {
@@ -128,19 +193,171 @@ Future<void> main() async {
     return;
   }
 
-  stdout.writeln('Fetching corp codes from DART API...');
-  final List<CorpInfo> corpList = await fetchAllCorpCodes(apiKey);
-  if (corpList.isEmpty) {
-    stdout.writeln('No corp codes retrieved from DART API.');
+  const String targetYear = '2023';
+  stdout.writeln('Fetching financial reports for $targetYear...');
+  final List<ReportInfo> reports =
+      await fetchFinancialReports(apiKey, targetYear);
+  if (reports.isEmpty) {
+    stdout.writeln('No financial reports retrieved for $targetYear.');
     return;
   }
 
-  stdout.writeln('Top 5 corporations:');
-  for (final CorpInfo corp in corpList.take(5)) {
+  stdout.writeln('Retrieved ${reports.length} financial report entries.');
+  await saveReportsToCsv(reports, targetYear);
+
+  stdout.writeln('Sample reports:');
+  for (final ReportInfo report in reports.take(5)) {
     stdout.writeln(
-      '- ${corp.corpName} (corp_code: ${corp.corpCode}, stock_code: ${corp.stockCode}, modify_date: ${corp.modifyDate})',
+      '- ${report.corpName} (${report.corpCode}) | year: ${report.bsnsYear}, net income: ${report.thstrmNtic}',
     );
   }
+}
 
-  await saveToCsv(corpList);
+Future<List<ReportInfo>> fetchFinancialReports(
+  String apiKey,
+  String targetYear,
+) async {
+  final File corpCsv = File(
+    '${Directory.current.path}${Platform.pathSeparator}output${Platform.pathSeparator}all_corp_codes.csv',
+  );
+  if (!corpCsv.existsSync()) {
+    stderr.writeln(
+      'Corp code CSV not found at ${corpCsv.path}. Run the corp code fetch first.',
+    );
+    return const <ReportInfo>[];
+  }
+
+  try {
+    final String csvContent = await corpCsv.readAsString(encoding: utf8);
+    final List<List<dynamic>> rows =
+        const CsvToListConverter().convert(csvContent);
+    if (rows.length <= 1) {
+      stderr.writeln('Corp code CSV does not contain any data rows.');
+      return const <ReportInfo>[];
+    }
+
+    String asCleanString(dynamic value) {
+      if (value == null) {
+        return '';
+      }
+      final String text = value.toString().trim();
+      if (text.isEmpty || text.toLowerCase() == 'null') {
+        return '';
+      }
+      return text;
+    }
+
+    final List<ReportInfo> reports = <ReportInfo>[];
+    final Iterable<List<dynamic>> corpRows = rows.skip(1);
+
+    for (final List<dynamic> row in corpRows) {
+      if (row.isEmpty) {
+        continue;
+      }
+      final String corpCode = asCleanString(row.first);
+      if (corpCode.isEmpty) {
+        continue;
+      }
+      final String corpName =
+          row.length > 1 ? asCleanString(row[1]) : '';
+
+      final Uri requestUri = Uri.parse(
+        '${dartBaseUrl.trim()}${FIN_RPT_ENDPOINT.trim()}'
+        '?crtfc_key=$apiKey'
+        '&corp_code=$corpCode'
+        '&bsns_year=$targetYear'
+        '&reprt_code=11011',
+      );
+
+      try {
+        final http.Response response = await http.get(requestUri);
+        if (response.statusCode != 200) {
+          stderr.writeln(
+            'HTTP ${response.statusCode} fetching financials for $corpCode.',
+          );
+        } else {
+          final Map<String, dynamic> data =
+              jsonDecode(utf8.decode(response.bodyBytes))
+                  as Map<String, dynamic>;
+          final String status = data['status']?.toString() ?? '';
+          if (status != '000') {
+            stderr.writeln(
+              'DART API error for $corpCode: $status - ${data['message']}',
+            );
+          } else {
+            final List<dynamic>? list = data['list'] as List<dynamic>?;
+            if (list == null || list.isEmpty) {
+              stderr.writeln(
+                'No financial data returned for $corpCode ($corpName).',
+              );
+            } else {
+              for (final dynamic item in list) {
+                if (item is! Map<String, dynamic>) {
+                  continue;
+                }
+                final ReportInfo report = ReportInfo.fromJson(
+                  item,
+                  fallbackCorpName: corpName,
+                );
+                reports.add(report);
+              }
+            }
+          }
+        }
+      } catch (error) {
+        stderr.writeln('Failed to fetch financials for $corpCode: $error');
+      }
+
+      await Future.delayed(const Duration(milliseconds: 500));
+    }
+
+    return reports;
+  } catch (error) {
+    stderr.writeln('Failed to read corp code CSV: $error');
+    return const <ReportInfo>[];
+  }
+}
+
+Future<void> saveReportsToCsv(
+  List<ReportInfo> reports,
+  String targetYear,
+) async {
+  final Directory outputDir = Directory('output');
+  if (!outputDir.existsSync()) {
+    outputDir.createSync(recursive: true);
+  }
+
+  final List<List<dynamic>> rows = <List<dynamic>>[
+    <String>[
+      'corp_code',
+      'corp_name',
+      'biz_repr',
+      'bsns_year',
+      'fs_div',
+      'stock_code',
+      'oprt_prfit',
+      'thstrm_ntic',
+      'fncl_totasset',
+    ],
+    ...reports.map(
+      (ReportInfo report) => <String>[
+        report.corpCode,
+        report.corpName,
+        report.bizRepr,
+        report.bsnsYear,
+        report.fsDiv,
+        report.stockCode,
+        report.oprtPrfit,
+        report.thstrmNtic,
+        report.fnclTotasset,
+      ],
+    ),
+  ];
+
+  final String csvData = const ListToCsvConverter().convert(rows);
+  final File csvFile = File(
+    '${outputDir.path}${Platform.pathSeparator}financial_reports_$targetYear.csv',
+  );
+  await csvFile.writeAsString(csvData, encoding: utf8);
+  stdout.writeln('Saved financial reports to: ${csvFile.path}');
 }
